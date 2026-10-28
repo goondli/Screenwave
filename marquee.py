@@ -53,9 +53,10 @@ class Animation:
         self._guard("draw", self.module.draw, pen, wave)
 
 
-def discover(directory=ANIMATIONS_DIR):
+def discover(directory=ANIMATIONS_DIR, errors=None):
     """{key: Animation} for every animations/*.py not starting with _.
-    A file that fails to import is reported and left out."""
+    A file that fails to import is reported, left out, and its error put in
+    `errors` ({key: message}) if given."""
     found = {}
     for path in sorted(directory.glob("*.py")):
         if path.name.startswith("_"):
@@ -70,6 +71,8 @@ def discover(directory=ANIMATIONS_DIR):
             found[key] = Animation(key, module)
         except Exception as e:
             log(f"animation {path.name} not loaded: {e}")
+            if errors is not None:
+                errors[key] = f"{type(e).__name__}: {e}"
     return found
 
 
@@ -81,10 +84,11 @@ class Marquee:
         self.rng = random.Random(seed)
         self.seed_base = self.rng.randrange(1 << 30)
         all_anims = discover() if animations is None else animations
-        keys = [only] if only else [k for k in settings.enabled if k in all_anims]
-        missing = [k for k in ([only] if only else settings.enabled) if k not in all_anims]
-        for k in missing if not quiet else ():
-            log(f"animation {k!r} is enabled but there is no animations/{k}.py")
+        wanted = [only] if only else settings.enabled
+        keys = [k for k in wanted if k in all_anims]
+        for k in [k for k in wanted if k not in all_anims] if not quiet else ():
+            log(f"animation {k!r} is enabled but not loaded (no animations/{k}.py, "
+                f"or it failed to load: see above)")
         self.anims = [all_anims[k] for k in keys]
         self.waves = []  # [(Wave, Animation or None, born)]
         self.count = 0
@@ -166,11 +170,12 @@ class Marquee:
     # -- drawing --------------------------------------------------------------
     def draw(self, snap, view):
         """Draw what `view` (a kit.Screen) shows, on a snapshot whose origin
-        is that screen's top-left corner."""
-        snap.append_color(rgba(self.s.background), grect(0, 0, view.w, view.h))
+        is that screen's top-left corner, in that monitor's pixels."""
+        snap.append_color(rgba(self.s.background), grect(0, 0, view.pw, view.ph))
         if self.dark:
             return
         snap.save()
+        snap.scale(view.scale, view.scale)  # scene units -> this monitor's pixels
         snap.translate(gpoint(-view.x, -view.y))
         pen = Pen(snap, view, self.world)
         for wave, anim, _born in self.waves:
@@ -186,7 +191,7 @@ class Marquee:
         if self.run_seconds > 0 and self.age() > self.run_seconds:
             cover = max(cover, min(1.0, (self.age() - self.run_seconds) / FADE_OUT))
         if cover > 0:
-            snap.append_color(rgba(self.s.background, cover), grect(0, 0, view.w, view.h))
+            snap.append_color(rgba(self.s.background, cover), grect(0, 0, view.pw, view.ph))
 
     def _draw_text(self, pen, wave):
         if not pen.visible(wave.x - self.size, wave.y - wave.h, wave.x + wave.w + self.size,
@@ -236,20 +241,52 @@ class Marquee:
             snap.restore()
 
     def _glyphs(self, text, lay):
-        """[(x offset, layout, width)] per non-space character, positioned as
-        Pango laid out the whole line (keeps kerning). Cached per text."""
+        """[(x offset, layout, width)] per piece that ripples on its own,
+        positioned as Pango laid out the whole line (keeps kerning). Cached.
+
+        A piece is one shaping cluster as Pango saw it, not one code point,
+        so accents and emoji sequences stay whole. Scripts whose letters are
+        shaped together across clusters (Hindi matras and conjuncts, Arabic
+        joining, Thai...) ripple word by word instead, so they never come
+        apart."""
         cache = self.__dict__.setdefault("_glyph_cache", {})
         hit = cache.get(text)
         if hit is not None:
             return hit
+        raw = text.encode("utf-8")
+        cuts = []  # byte offsets where a piece starts
+        if any(_shaped_across_clusters(ch) for ch in text):
+            byte = 0
+            for word in text.split(" "):
+                cuts.append(byte)
+                byte += len(word.encode("utf-8")) + 1
+        else:
+            it = lay.get_iter()
+            while True:
+                cuts.append(it.get_index())
+                if not it.next_cluster():
+                    break
+        cuts = sorted(set(c for c in cuts if c < len(raw))) + [len(raw)]
         out = []
-        byte = 0
-        for ch in text:
-            nbytes = len(ch.encode("utf-8"))
-            if not ch.isspace():
-                pos = lay.index_to_pos(byte)
-                glay = text_layout(ch, self.size, self.font)
-                out.append((pos.x / Pango.SCALE, glay, pos.width / Pango.SCALE))
-            byte += nbytes
+        for start, end in zip(cuts, cuts[1:]):
+            piece = raw[start:end].decode("utf-8", errors="ignore")
+            if not piece.strip():
+                continue
+            x0 = lay.index_to_pos(start).x / Pango.SCALE
+            x1 = lay.index_to_pos(end).x / Pango.SCALE if end < len(raw) else \
+                lay.get_pixel_extents()[1].width
+            glay = text_layout(piece, self.size, self.font)
+            out.append((x0, glay, max(1.0, x1 - x0)))
         cache[text] = out
         return out
+
+
+def _shaped_across_clusters(ch):
+    """Scripts where letters change shape with their neighbours: Arabic,
+    Syriac, Thaana, N'Ko (joining); Devanagari and the other Indic scripts
+    (matras, conjuncts); Thai, Lao, Tibetan, Myanmar, Khmer; Mongolian.
+    Shaped one piece at a time they would come apart."""
+    o = ord(ch)
+    return (0x0600 <= o <= 0x08FF or 0xFB50 <= o <= 0xFDFF or 0xFE70 <= o <= 0xFEFF
+            or 0x0900 <= o <= 0x0DFF or 0x0E00 <= o <= 0x109F or 0x1780 <= o <= 0x18AF
+            or 0xA8E0 <= o <= 0xA8FF)

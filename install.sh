@@ -39,7 +39,9 @@ gio set "$DESKTOP/Logicloom Screensaver.desktop" metadata::trusted true 2>/dev/n
 
 cp "$HERE/logicloom-saver.service" "$UNITS/"
 systemctl --user daemon-reload
-systemctl --user enable --now logicloom-saver.service
+systemctl --user enable logicloom-saver.service
+# restart, not just start: a re-run must pick up new idle_watch.py code
+systemctl --user restart logicloom-saver.service
 
 update-desktop-database "$APPS" 2>/dev/null || true
 gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true

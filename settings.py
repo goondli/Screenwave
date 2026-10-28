@@ -40,7 +40,8 @@ def parse_lines(text):
 
 
 def parse_names(text):
-    return [n.strip() for n in text.replace("\n", ",").split(",") if n.strip()]
+    names = (n.strip() for n in text.replace("\n", ",").split(","))
+    return list(dict.fromkeys(n for n in names if n))  # no duplicates, order kept
 
 
 def ranged(cast, lo, hi):
@@ -61,6 +62,41 @@ def choice(*options):
         return t
     parse.options = options
     return parse
+
+
+def parse_yes(text):
+    t = text.strip().lower()
+    if t in ("yes", "true", "on", "1"):
+        return True
+    if t in ("no", "false", "off", "0"):
+        return False
+    raise ValueError("use yes or no")
+
+
+def parse_per_screen(lo, hi):
+    """'DP-2=12, DP-4=-3.5' -> {'DP-2': 12.0, 'DP-4': -3.5}"""
+    def parse(text):
+        out = {}
+        for part in text.replace("\n", ",").split(","):
+            if not part.strip():
+                continue
+            name, sep, value = part.partition("=")
+            if not sep or not name.strip():
+                raise ValueError(f"write it as SCREEN=number, e.g. DP-2=5 (got {part.strip()!r})")
+            v = float(value)
+            if not lo <= v <= hi:
+                raise ValueError(f"{name.strip()} must be between {lo} and {hi}")
+            out[name.strip()] = v
+        return out
+    return parse
+
+
+def write_yes(v):
+    return "yes" if v else "no"
+
+
+def write_per_screen(v):
+    return ", ".join(f"{k}={x:g}" for k, x in sorted(v.items()))
 
 
 def write_plain(v):
@@ -108,6 +144,22 @@ SPEC = {
                parse_hex_list, write_list, "Colours the animations draw with."),
     "order": ("animations", "in_turn", choice("in_turn", "random"), write_plain,
               "in_turn or random."),
+    # [screens]
+    "match_sizes": ("screens", True, parse_yes, write_yes,
+                    "Show things at the same real size on every monitor, even when\n"
+                    "their pixels differ (e.g. a 24\" next to 27\"s): yes / no."),
+    "level": ("screens", "bottoms", choice("bottoms", "centres", "tops", "gnome_layout"),
+              write_plain,
+              "Which edges of the monitors are level on the desk: bottoms, centres,\n"
+              "tops, or gnome_layout (the heights from GNOME's display settings).\n"
+              "Text then sits at the same real height on every monitor."),
+    "screen_shift": ("screens", {}, parse_per_screen(-500, 500), write_per_screen,
+                     "Move a monitor's picture up (+) or down (-), in mm, so lines run\n"
+                     "straight across monitors mounted at different heights.\n"
+                     "e.g. DP-2=12, DP-4=-3. 'Line up screens' in the window sets this."),
+    "screen_inches": ("screens", {}, parse_per_screen(5, 120), write_per_screen,
+                      "Only if a monitor reports the wrong size: its diagonal in inches,\n"
+                      "e.g. DP-4=23.8."),
     # [saver]
     "idle_minutes": ("saver", 5.0, ranged(float, 0.1, 1440), write_plain,
                      "Minutes without keyboard or mouse before it starts."),
@@ -117,18 +169,22 @@ SPEC = {
     "fps": ("saver", 72, ranged(int, 10, 240), write_plain,
             "Highest frames per second on the 144 Hz screens. Lower = less CPU."),
 }
-SECTIONS = ["marquee", "animations", "saver"]
+SECTIONS = ["marquee", "animations", "screens", "saver"]
 
 
 class Settings:
     def __init__(self, **values):
         for key, (_s, default, *_r) in SPEC.items():
-            setattr(self, key, list(default) if isinstance(default, list) else default)
+            if isinstance(default, (list, dict)):
+                default = type(default)(default)  # never share the default
+            setattr(self, key, default)
         for key, value in values.items():
             setattr(self, key, value)
 
     def copy(self):
-        return Settings(**{k: getattr(self, k) for k in SPEC})
+        def own(v):
+            return type(v)(v) if isinstance(v, (list, dict)) else v
+        return Settings(**{k: own(getattr(self, k)) for k in SPEC})
 
 
 def load(path=SETTINGS_FILE, warn=None):
@@ -142,9 +198,22 @@ def load(path=SETTINGS_FILE, warn=None):
         except OSError as e:
             warn(f"could not create {path}: {e}")
         return s
-    cp = configparser.ConfigParser(interpolation=None)
     try:
-        cp.read(path)
+        # errors="replace": one bad byte spoils only its own value
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        warn(f"{path} unreadable, using defaults: {e}")
+        return s
+    if "�" in text:
+        warn(f"{path} is not UTF-8; unreadable characters were replaced")
+    # Comments are only lines starting with # or ; in column 0. configparser
+    # would also drop INDENTED ones, which are marquee lines like "#1 IN AI".
+    text = "\n".join(ln for ln in text.splitlines() if not ln.startswith(("#", ";")))
+    # strict=False: a repeated key or section keeps the last value instead of
+    # throwing the whole file away
+    cp = configparser.ConfigParser(interpolation=None, comment_prefixes=(), strict=False)
+    try:
+        cp.read_string(text)
     except configparser.Error as e:
         warn(f"{path} unreadable, using defaults: {e}")
         return s

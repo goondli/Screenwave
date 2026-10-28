@@ -19,7 +19,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 import settings as S  # noqa: E402
 from marquee import ANIMATIONS_DIR, Marquee, discover  # noqa: E402
-from saver import LayoutPreview, world_of  # noqa: E402
+from saver import LayoutPreview, monitors, world_of  # noqa: E402
 
 APP_ID = "in.maridian.LogicloomSaver.Settings"
 HERE = Path(__file__).resolve().parent
@@ -49,9 +49,16 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(820, 960)
         self.warnings = []
         self.s = S.load(warn=self.warnings.append)
-        self.anims = discover()
-        self.world = world_of(Gdk.Display.get_default())
+        self.load_errors = {}
+        self.anims = discover(errors=self.load_errors)
+        self.world = world_of(Gdk.Display.get_default(), self.s)
         self._save_id = 0
+        # flush a pending autosave when the window closes
+        self.connect("close-request", lambda *_a: (self._flush(), False)[1])
+        # pick up edits made to the file by hand ("Open settings file")
+        self._file_monitor = Gio.File.new_for_path(str(S.SETTINGS_FILE)).monitor_file(
+            Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self._file_monitor.connect("changed", self.on_file_changed)
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -110,11 +117,43 @@ class Window(Adw.ApplicationWindow):
             self.toast(f"Could not save: {e}")
         return GLib.SOURCE_REMOVE
 
+    def _flush(self):
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+            self.save_now()
+
+    def on_file_changed(self, _mon, _file, _other, event):
+        if event not in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
+                         Gio.FileMonitorEvent.RENAMED, Gio.FileMonitorEvent.MOVED_IN):
+            return
+        try:
+            text = S.SETTINGS_FILE.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        if text == S.render(self.s):
+            return  # our own save
+        self._flush_pending_cancel()
+        self.s = S.load(warn=self.toast)
+        self.build()
+        self.rebuild_preview()
+        self.toast("Settings file changed outside this window: reloaded")
+
+    def _flush_pending_cancel(self):
+        # the file on disk is newer than our pending edit: drop the edit
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+            self._save_id = 0
+
     def rebuild_preview(self):
+        # screen settings change the layout itself
+        self.world = world_of(Gdk.Display.get_default(), self.s)
         # quiet: the page already shows a "Not found" row for missing files
         self.preview.set_scene(Marquee(self.world, self.s.copy(), animations=self.anims, quiet=True))
 
     def spin(self, group, title, subtitle, key, lo, hi, step, digits=0):
+        # the settings file's own limits win, so every valid value shows
+        parse = S.SPEC[key][2]
+        lo, hi = getattr(parse, "lo", lo), getattr(parse, "hi", hi)
         row = Adw.SpinRow.new_with_range(lo, hi, step)
         row.set_title(title)
         if subtitle:
@@ -222,7 +261,9 @@ class Window(Adw.ApplicationWindow):
             row.set_active(key in self.s.enabled)
             row.connect("notify::active", self.on_anim_toggle, key)
             g.add(row)
-        missing = [k for k in self.s.enabled if k not in self.anims]
+        for key, err in sorted(self.load_errors.items()):
+            g.add(Adw.ActionRow(title=f"Could not load: {key}.py", subtitle=err))
+        missing = [k for k in self.s.enabled if k not in self.anims and k not in self.load_errors]
         if missing:
             g.add(Adw.ActionRow(title="Not found: " + ", ".join(missing),
                                 subtitle="Enabled in settings but no matching file"))
@@ -242,6 +283,44 @@ class Window(Adw.ApplicationWindow):
             b.connect("clicked", fn)
             buttons.append(b)
         g.add(buttons)
+
+        # screens
+        g = group("Screens", "Monitors of different sizes show everything at the same real "
+                  "height. If one is mounted higher or lower, line them up.")
+        row = Adw.SwitchRow(title="Same size on every screen",
+                            subtitle="Zoom smaller-pixel monitors to match the others")
+        row.set_active(self.s.match_sizes)
+
+        def on_match(r, _p):
+            self.s.match_sizes = r.get_active()
+            self.changed()
+        row.connect("notify::active", on_match)
+        g.add(row)
+        self.combo(g, "Monitors are level at", "level",
+                   [("bottoms", "Bottom edges"), ("centres", "Centres"), ("tops", "Top edges"),
+                    ("gnome_layout", "As in GNOME display settings")])
+        for _mon, (name, _x, _y, w, h, wmm, hmm, inches) in monitors(Gdk.Display.get_default()):
+            size = f'{inches:g}"' if inches else (f"{wmm}x{hmm} mm" if wmm else "size unknown")
+            spin = Adw.SpinRow.new_with_range(-500, 500, 1)
+            spin.set_title(f"{name}  ·  {size}  ·  {w}x{h}")
+            spin.set_subtitle("Move this screen's picture up (+) or down (-), in mm")
+            spin.set_digits(1)
+            spin.set_value(self.s.screen_shift.get(name, 0.0))
+
+            def on_shift(r, _p, name=name):
+                v = round(r.get_value(), 1)
+                if v:
+                    self.s.screen_shift[name] = v
+                else:
+                    self.s.screen_shift.pop(name, None)
+                self.changed()
+            spin.connect("notify::value", on_shift)
+            g.add(spin)
+        align = Adw.ButtonRow(title="Line up screens…", start_icon_name="view-grid-symbolic")
+        align.set_tooltip_text("Shows lines across all screens. Point at a screen, press "
+                               "Up/Down until the lines run straight, then Enter.")
+        align.connect("activated", self.on_align)
+        g.add(align)
 
         # running
         g = group("When it runs")
@@ -340,7 +419,8 @@ class Window(Adw.ApplicationWindow):
         Gtk.FileLauncher.new(Gio.File.new_for_path(str(ANIMATIONS_DIR))).launch(self, None, None)
 
     def on_reload(self, *_):
-        self.anims = discover()
+        self.load_errors = {}
+        self.anims = discover(errors=self.load_errors)
         self.build()
         self.rebuild_preview()
         self.toast(f"{len(self.anims)} animations loaded")
@@ -371,7 +451,8 @@ class Window(Adw.ApplicationWindow):
             text = (ANIMATIONS_DIR / "_template.py").read_text()
             text = text.replace('NAME = "AI chip (example)"', f'NAME = "{key.replace("_", " ").title()}"')
             path.write_text(text)
-            self.s.enabled = [*self.s.enabled, key]
+            if key not in self.s.enabled:
+                self.s.enabled = [*self.s.enabled, key]
             self.on_reload()
             self.changed()
             Gtk.FileLauncher.new(Gio.File.new_for_path(str(path))).launch(self, None, None)
@@ -389,6 +470,21 @@ class Window(Adw.ApplicationWindow):
             code, out = systemctl("disable", "--now", SERVICE)
         if code != 0:
             self.toast(f"systemctl failed: {out}")
+
+    def on_align(self, *_):
+        """Line-up pattern on the real screens; afterwards read back what it saved."""
+        self.save_now()
+        proc = Gio.Subprocess.new([sys.executable, str(HERE / "saver.py"), "--align"],
+                                  Gio.SubprocessFlags.NONE)
+
+        def done(p, result):
+            p.wait_finish(result)
+            self.s.screen_shift = S.load(warn=lambda m: None).screen_shift
+            self.build()
+            self.rebuild_preview()
+            shifts = S.write_per_screen(self.s.screen_shift) or "none"
+            self.toast(f"Screen positions: {shifts}")
+        proc.wait_async(None, done)
 
     def on_run(self, *_):
         self.save_now()

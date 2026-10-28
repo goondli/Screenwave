@@ -46,6 +46,8 @@ def to_rgb(color):
     """'#4dd9ff' or (r, g, b) in 0..1 -> (r, g, b)."""
     if isinstance(color, str):
         h = color.lstrip("#")
+        if len(h) == 3:  # '#fff'
+            h = "".join(c * 2 for c in h)
         return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
     return tuple(color)
 
@@ -108,8 +110,18 @@ def pulse(t, period, width=0.25):
 
 # -- layout of the monitors ---------------------------------------------------
 class Screen:
-    def __init__(self, x, y, w, h, name=""):
+    """One monitor's place in the scene.
+
+    x, y, w, h   in scene units: pixels of the screen with the biggest pixels
+                 (so a shape is the same size in mm on every monitor)
+    scale        monitor pixels per scene unit (1.12 on a 24" next to 27"s)
+    pw, ph       the monitor's own size in pixels
+    """
+
+    def __init__(self, x, y, w, h, name="", scale=1.0):
         self.x, self.y, self.w, self.h, self.name = x, y, w, h, name
+        self.scale = scale
+        self.pw, self.ph = w * scale, h * scale
 
     @property
     def x1(self):
@@ -160,6 +172,60 @@ class World:
             if s.x <= x <= s.x1 and (y is None or s.y <= y <= s.y1):
                 return s
         return min(self.screens, key=lambda s: abs((s.x + s.x1) / 2 - x))
+
+
+def pixel_mm(width_px, height_px, width_mm, height_mm, inches=None):
+    """Size of one pixel in mm, from a diagonal in inches if given, else from
+    the monitor's reported size (EDID rounds to whole cm, so average both
+    axes). None if neither is known."""
+    if inches:
+        return inches * 25.4 / math.hypot(width_px, height_px)
+    if width_mm > 0 and height_mm > 0:
+        return (width_mm / width_px + height_mm / height_px) / 2
+    return None
+
+
+def physical_world(monitors, match_sizes=True, shift_mm=None, inches=None, level="bottoms"):
+    """World in which every monitor shows things at the same size in mm.
+
+    monitors: [(name, x, y, w, h, width_mm, height_mm)] from GNOME's layout.
+    shift_mm: {name: mm} moves a monitor's picture up (+) or down (-), for
+              monitors mounted at different heights.
+    inches:   {name: diagonal} overrides a wrong reported size.
+    level:    which edges are level on the desk: "bottoms", "centres" or
+              "tops" places the monitors by their real heights; "gnome_layout"
+              keeps the heights from GNOME's display settings.
+
+    Monitors that touch side by side in GNOME's layout still touch here;
+    a monitor with smaller pixels just covers less of the scene.
+    """
+    shift_mm, inches = shift_mm or {}, inches or {}
+    mm = {n: pixel_mm(w, h, wmm, hmm, inches.get(n)) for n, _x, _y, w, h, wmm, hmm in monitors}
+    known = [v for v in mm.values() if v]
+    ref = max(known) if (match_sizes and known) else None
+    def units_per_px(name):
+        return (mm[name] / ref) if (ref and mm[name]) else 1.0
+
+    tallest = max(h * units_per_px(n) for n, _x, _y, _w, h, *_r in monitors)
+    screens = []
+    for name, x, y, w, h, _wmm, _hmm in sorted(monitors, key=lambda m: (m[1], m[2])):
+        k = units_per_px(name)  # scene units per pixel
+        sx, sy = float(x), float(y)
+        if level == "bottoms":
+            sy = tallest - h * k
+        elif level == "centres":
+            sy = (tallest - h * k) / 2
+        elif level == "tops":
+            sy = 0.0
+        for prev, (_n, px, py, pw, ph, *_r) in zip(screens, sorted(monitors, key=lambda m: (m[1], m[2]))):
+            if abs(px + pw - x) <= 1 and py < y + h and y < py + ph:  # left neighbour in GNOME
+                sx = prev.x + prev.w
+        unit_mm = ref or mm[name] or 0.265  # mm per scene unit, for shift
+        sy += shift_mm.get(name, 0.0) / unit_mm
+        screens.append(Screen(sx, sy, w * k, h * k, name, scale=1 / k))
+    world = World(screens)
+    world.unit_mm = ref or (max(known) if known else 0.265)
+    return world
 
 
 # -- a wave: one line of text plus one animation crossing the screens ---------
