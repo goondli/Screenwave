@@ -1,60 +1,84 @@
-# 3-screens: Logicloom Screensaver
+# ScreenWave
 
-A screensaver for GNOME on Wayland that runs one marquee across several
-monitors. Lines of text ("LOGICLOOM LLP", "ROBOTICS", "ARTIFICIAL
-INTELLIGENCE") travel in waves from one monitor to the next, and each wave
-carries a robotics or AI animation.
+A screensaver for Linux desktops that runs one marquee across one, two,
+three, four or more monitors. Lines of text travel in waves from one monitor
+to the next, and each wave carries an animation: neural network, circuit
+board, robot march, data stream or AI chip. You can also add your own.
 
-Ubuntu 26.04 (GNOME 50) has no X11 session, so classic screensavers such as
-XScreenSaver cannot run. This one is a GTK 4 app. It opens one fullscreen
-window per monitor and draws one shared scene, shifted by each monitor's
-position. Drawing goes through `Gtk.Snapshot`, so the GPU renders it.
+ScreenWave is made for Wayland, which classic screensavers such as
+XScreenSaver cannot use. It is a GTK 4 app that opens one fullscreen window
+per monitor and draws one shared scene, shifted by each monitor's position.
+The GPU does the drawing (`Gtk.Snapshot`).
 
-## Features
+Free to use, change and share under the [MIT licence](LICENSE).
 
-- **Same real size and height on every monitor.** The scene is laid out in
-  millimetres, using each monitor's reported size. A 24″ screen next to 27″
-  screens is zoomed to match. You choose which edges of the monitors are
-  level on the desk (bottoms, centres or tops). **Line up screens** shows a
-  pattern you can fine-tune with the arrow keys.
-- **Animations as plug-ins:** neural network, circuit board, robot march,
-  data stream and AI chip. Each is one file in `animations/`.
-- **Settings window** (libadwaita) with a live preview. You can change:
-  - **Text:** lines, font, size and colours.
-  - **Motion:** ripple, speed, direction and gap between waves.
-  - **Animations:** which ones run, their order and colours.
-  - **When it runs:** idle time, how long it plays, and a frame-rate limit.
-- **Idle watcher.** It uses GNOME's own idle monitor. It does not start
-  while the screen is locked, while an app is blocking idle (for example a
-  video playing), or while `~/.config/logicloom-saver/paused` exists.
+## Works with your monitors
 
-Any key, click, scroll or mouse movement closes the screensaver. Each time
-it closes, it logs the reason.
+- **Any number and arrangement.** Monitors can sit side by side or stacked
+  (a laptop below an external screen, a 2×2 grid). Landscape and portrait
+  both work, as do HiDPI and fractional scaling, mixed refresh rates, and
+  projectors that don't report their size.
+- **Choose where it plays.** Switch each monitor on or off. Monitors left
+  out go black or keep showing the desktop.
+- **Same real size and height.** The scene is laid out in millimetres from
+  each monitor's reported size, so a 24″ screen next to 27″ ones shows
+  everything at the same size. Tell it which edges are level on your desk
+  (bottoms, centres or tops), or use **Line up screens**: a pattern you
+  nudge with the arrow keys until the lines run straight.
 
 ## Install
 
-Needs Python 3 with PyGObject, GTK 4 and libadwaita, which ship with
-Ubuntu's desktop.
+You need Python 3 with PyGObject, GTK 4 and libadwaita. Ubuntu, Fedora and
+other GNOME desktops ship them; if one is missing, `install.sh` tells you
+the package names.
 
 ```sh
-git clone https://github.com/goondli/3-screens.git ~/logicloom-saver
-sh ~/logicloom-saver/install.sh
+git clone https://github.com/goondli/screenwave.git ~/screenwave
+sh ~/screenwave/install.sh
 ```
 
 This installs the following for the current user, without sudo:
 
-- the **Logicloom Screensaver** app and a Desktop launcher;
-- the idle watcher as the systemd user service `logicloom-saver.service`.
+- the **ScreenWave** app in the app grid and a launcher on the Desktop;
+- the idle watcher as the systemd user service `screenwave.service`.
 
-The service expects the folder at `~/logicloom-saver`.
+The folder can be anywhere. Run `install.sh` again after moving or updating
+it. `sh install.sh --uninstall` removes everything except your settings.
 
-Settings live in `~/.config/logicloom-saver/settings.ini`. The settings
-window writes this file, and every option in it is explained in comments.
+## Using it
+
+Open **ScreenWave** from the app grid or the Desktop.
+
+- **Enable / Disable:** turns the automatic start after idle on and off.
+- **Apply / Revert:** your changes show in the live preview at the top
+  first. **Apply** saves them; **Revert** drops them.
+- **Preview on screens:** plays it now with the settings shown, applied or
+  not. Any key, click or mouse movement stops it.
+
+The settings cover:
+
+- **Monitors:** which ones it plays on.
+- **Marquee text:** the lines, font, size, colours and ripple.
+- **Motion:** speed, direction and the gap between waves.
+- **Animations:** which ones run, their order and colours.
+- **Sizes and heights:** matching sizes, which edges are level, and
+  per-monitor fine-tuning.
+- **When it runs:** idle time, how long it plays before fading to black,
+  and a frame-rate limit.
+
+Settings are saved in `~/.config/screenwave/settings.ini`, where every
+option is explained in comments.
+
+The idle watcher uses GNOME's idle monitor. On other desktops (KDE and
+others) it polls the standard `org.freedesktop.ScreenSaver` idle time
+instead. It does not start the screensaver while the screen is locked,
+while an app is blocking idle (for example a video playing), or while
+`~/.config/screenwave/paused` exists.
 
 ## Write your own animation
 
-In the settings window, click **New animation…**. It copies
-`animations/_template.py`. An animation is one Python file:
+In the app, click **New animation…**. It copies `animations/_template.py`.
+An animation is one Python file:
 
 ```python
 NAME = "My animation"
@@ -84,7 +108,12 @@ python3 saver.py --profile --only my_animation
 |---|---|
 | `saver.py` | run until input |
 | `saver.py --duration 30` | run for 30 seconds |
-| `saver.py --align` | line-up pattern: ↑/↓ move the screen under the mouse, Enter saves |
+| `saver.py --settings file.ini` | use another settings file |
+| `saver.py --align` | line-up pattern: ↑/↓ move the monitor under the mouse, Enter saves |
 | `saver.py --snapshot out.png --at 8` | picture of all monitors at t = 8 s |
 | `saver.py --profile` | drawing time per monitor per frame |
-| `LOGICLOOM_DEBUG=1 saver.py` | log frames drawn per monitor every 2 s |
+| `SCREENWAVE_DEBUG=1 saver.py` | log frames drawn per monitor every 2 s |
+
+Every time the screensaver closes, it logs why: which key, click or mouse
+movement, or a monitor change. When it is started by the idle watcher, find
+these lines with `journalctl --user -u screenwave`.

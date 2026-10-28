@@ -1,4 +1,4 @@
-"""The Logicloom marquee scene: waves of text, each carrying one animation,
+"""The ScreenWave marquee scene: waves of text, each carrying one animation,
 travelling across every monitor.
 
 A wave starts just off the first screen, crosses the whole layout at
@@ -21,7 +21,7 @@ FADE_OUT = 3.0
 
 
 def log(msg):
-    print(f"logicloom-saver: {msg}", file=sys.stderr, flush=True)
+    print(f"screenwave: {msg}", file=sys.stderr, flush=True)
 
 
 # -- animation plug-ins --------------------------------------------------------
@@ -63,7 +63,7 @@ def discover(directory=ANIMATIONS_DIR, errors=None):
             continue
         key = path.stem
         try:
-            spec = importlib.util.spec_from_file_location(f"logicloom_anim_{key}", path)
+            spec = importlib.util.spec_from_file_location(f"screenwave_anim_{key}", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             if not callable(getattr(module, "draw", None)):
@@ -133,7 +133,7 @@ class Marquee:
     def _spawn(self):
         i = self.count
         self.count += 1
-        lines = self.s.lines or ["LOGICLOOM LLP"]
+        lines = self.s.lines or ["YOUR TEXT HERE"]
         text = lines[i % len(lines)]
         anim = None
         if self.anims:

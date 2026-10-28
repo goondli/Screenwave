@@ -1,4 +1,4 @@
-"""Drawing kit for Logicloom Screensaver animations.
+"""Drawing kit for ScreenWave animations.
 
 An animation is one .py file in the animations/ folder:
 
@@ -156,8 +156,12 @@ class World:
         top = max(s.y for s in screens)
         bottom = min(s.y1 for s in screens)
         if bottom - top < 100:
-            top, bottom = self.y0, self.y1
+            # no height all screens share (e.g. one stacked above another):
+            # run the text across the widest screen's height
+            widest = max(screens, key=lambda s: s.w)
+            top, bottom = widest.y, widest.y1
         self.band_top, self.band_bottom = top, bottom
+        self.unit_mm = 0.265  # mm per scene unit; physical_world sets the real one
 
     @property
     def w(self):
@@ -185,30 +189,44 @@ def pixel_mm(width_px, height_px, width_mm, height_mm, inches=None):
     return None
 
 
-def physical_world(monitors, match_sizes=True, shift_mm=None, inches=None, level="bottoms"):
+def physical_world(monitors, match_sizes=True, shift_mm=None, inches=None, level="bottoms",
+                   use=None):
     """World in which every monitor shows things at the same size in mm.
 
-    monitors: [(name, x, y, w, h, width_mm, height_mm)] from GNOME's layout.
+    monitors: [(name, x, y, w, h, width_mm, height_mm)] from the desktop's
+              display layout (logical pixels), any number, any arrangement.
     shift_mm: {name: mm} moves a monitor's picture up (+) or down (-), for
               monitors mounted at different heights.
     inches:   {name: diagonal} overrides a wrong reported size.
     level:    which edges are level on the desk: "bottoms", "centres" or
-              "tops" places the monitors by their real heights; "gnome_layout"
-              keeps the heights from GNOME's display settings.
+              "tops" places side-by-side monitors by their real heights;
+              "gnome_layout" keeps the heights from the display settings.
+              Monitors stacked above each other always follow the layout.
+    use:      names of the monitors to keep (None or empty = all). The world
+              is laid out with every monitor first, so a left-out monitor
+              stays a real gap between the ones kept.
 
-    Monitors that touch side by side in GNOME's layout still touch here;
-    a monitor with smaller pixels just covers less of the scene.
+    Monitors that touch in the layout still touch here; a monitor with
+    smaller pixels just covers less of the scene.
     """
     shift_mm, inches = shift_mm or {}, inches or {}
     mm = {n: pixel_mm(w, h, wmm, hmm, inches.get(n)) for n, _x, _y, w, h, wmm, hmm in monitors}
     known = [v for v in mm.values() if v]
     ref = max(known) if (match_sizes and known) else None
+
     def units_per_px(name):
         return (mm[name] / ref) if (ref and mm[name]) else 1.0
 
+    ordered = sorted(monitors, key=lambda m: (m[1], m[2]))
+    # stacked: two monitors share some width, so one is above the other
+    stacked = any(min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]) > 10
+                  for i, a in enumerate(ordered) for b in ordered[i + 1:])
+    if stacked:
+        level = "gnome_layout"
     tallest = max(h * units_per_px(n) for n, _x, _y, _w, h, *_r in monitors)
-    screens = []
-    for name, x, y, w, h, _wmm, _hmm in sorted(monitors, key=lambda m: (m[1], m[2])):
+    placed = []  # (layout tuple, Screen)
+    for mon in ordered:
+        name, x, y, w, h, _wmm, _hmm = mon
         k = units_per_px(name)  # scene units per pixel
         sx, sy = float(x), float(y)
         if level == "bottoms":
@@ -217,13 +235,20 @@ def physical_world(monitors, match_sizes=True, shift_mm=None, inches=None, level
             sy = (tallest - h * k) / 2
         elif level == "tops":
             sy = 0.0
-        for prev, (_n, px, py, pw, ph, *_r) in zip(screens, sorted(monitors, key=lambda m: (m[1], m[2]))):
-            if abs(px + pw - x) <= 1 and py < y + h and y < py + ph:  # left neighbour in GNOME
-                sx = prev.x + prev.w
+        for (_n, px, py, pw, ph, *_r), prev in placed:
+            if abs(px + pw - x) <= 1 and py < y + h and y < py + ph:  # left neighbour
+                sx = prev.x1
+                if level == "gnome_layout":  # keep the layout's offset, in scene units
+                    sy = prev.y + (y - py) * prev.h / ph
+            elif abs(py + ph - y) <= 1 and px < x + w and x < px + pw:  # neighbour above
+                sy = prev.y1
+                sx = prev.x + (x - px) * prev.w / pw
         unit_mm = ref or mm[name] or 0.265  # mm per scene unit, for shift
         sy += shift_mm.get(name, 0.0) / unit_mm
-        screens.append(Screen(sx, sy, w * k, h * k, name, scale=1 / k))
-    world = World(screens)
+        placed.append((mon, Screen(sx, sy, w * k, h * k, name, scale=1 / k)))
+    screens = [s for _m, s in placed]
+    kept = [s for s in screens if s.name in use] if use else []
+    world = World(kept or screens)
     world.unit_mm = ref or (max(known) if known else 0.265)
     return world
 

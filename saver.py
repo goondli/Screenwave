@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Logicloom Screensaver: the marquee across every monitor.
+"""ScreenWave: the marquee across every monitor.
 
 GNOME on Wayland will not let one window span monitors, so this opens one
 fullscreen window per monitor. All of them draw the same Marquee scene, each
@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 
 import gi
 
@@ -35,7 +36,7 @@ import settings as settings_mod  # noqa: E402
 from kit import Pen, gpoint, grect, physical_world, rgba  # noqa: E402
 from marquee import Marquee  # noqa: E402
 
-APP_ID = "in.maridian.LogicloomSaver"
+APP_ID = "io.github.goondli.ScreenWave.Saver"
 GRACE = 1.2          # ignore input this long after start (pointer settles)
 MOVE_QUIT_PX = 14
 SETTLE = 0.8         # ignore motion this long after a window is mapped or resized
@@ -57,12 +58,20 @@ def monitors(display):
     return out
 
 
-def world_of(display, s):
+def world_of(display, s, all_monitors=False):
+    """The scene's layout for the monitors chosen in settings (or all)."""
     infos = [info for _m, info in monitors(display)]
     inches = {n: d for n, *_r, d in infos if d}
     inches.update(s.screen_inches)
     return physical_world([info[:7] for info in infos], s.match_sizes, s.screen_shift, inches,
-                          level=s.level)
+                          level=s.level, use=None if all_monitors else s.monitors)
+
+
+class BlankView(Gtk.Widget):
+    """Plain black, for monitors left out of the screensaver."""
+
+    def do_snapshot(self, snap):
+        snap.append_color(rgba("#000000"), grect(0, 0, self.get_width(), self.get_height()))
 
 
 def draw_layout(snap, scene, scale, gaps=(0.16, 0.16, 0.18)):
@@ -142,7 +151,7 @@ class ScreenView(Gtk.Widget):
     def __init__(self, scene, screen):
         super().__init__(hexpand=True, vexpand=True)
         self.scene, self.screen = scene, screen
-        self.draws = 0  # for LOGICLOOM_DEBUG
+        self.draws = 0  # for SCREENWAVE_DEBUG
 
     def do_snapshot(self, snap):
         self.draws += 1
@@ -195,8 +204,9 @@ class Saver(Gtk.Application):
         if self.windows:  # already running: a second launch is a no-op
             return
         display = Gdk.Display.get_default()
-        s = self.settings = settings_mod.load()
-        world = world_of(display, s)
+        s = self.settings = settings_mod.load(Path(self.args.settings)) if self.args.settings \
+            else settings_mod.load()
+        world = world_of(display, s, all_monitors=self.args.align)  # line up = all of them
         self.scene = AlignScene(world, s) if self.args.align else \
             Marquee(world, s, only=self.args.only)
         display.get_monitors().connect("items-changed", lambda *a: self._quit("monitors changed"))
@@ -204,8 +214,12 @@ class Saver(Gtk.Application):
 
         by_name = {sc.name: sc for sc in world.screens}
         for mon, info in monitors(display):
-            screen = by_name[info[0]]
-            win = Gtk.Window(application=self, title=f"Logicloom Screensaver {screen.name}")
+            screen = by_name.get(info[0])
+            if screen is None:  # a monitor left out in settings
+                if s.unused_monitors == "black":
+                    self._blank_window(mon, info[0])
+                continue
+            win = Gtk.Window(application=self, title=f"ScreenWave {screen.name}")
             win.set_decorated(False)
             view = ScreenView(self.scene, screen)
             if not self.args.align:  # the pattern only redraws when it changes
@@ -225,10 +239,22 @@ class Saver(Gtk.Application):
             self.views.append(view)
             GLib.timeout_add(1500, self._ensure_shown, win, mon, screen.name)
 
-        if os.environ.get("LOGICLOOM_DEBUG"):
+        if os.environ.get("SCREENWAVE_DEBUG"):
             GLib.timeout_add(2000, self._debug_report)
         if self.args.duration:
             GLib.timeout_add(int(self.args.duration * 1000), lambda: self._quit("--duration reached"))
+
+    def _blank_window(self, mon, name):
+        win = Gtk.Window(application=self, title=f"ScreenWave {name}")
+        win.set_decorated(False)
+        view = BlankView(hexpand=True, vexpand=True)
+        view.set_cursor_from_name("none")
+        win.set_child(view)
+        self._quit_on_input(win, name)
+        win.fullscreen_on_monitor(mon)
+        win.present()
+        self.windows.append(win)
+        GLib.timeout_add(1500, self._ensure_shown, win, mon, name)
 
     def _tick(self, view, clock, pace):
         every, count = pace
@@ -311,7 +337,7 @@ class Saver(Gtk.Application):
         return GLib.SOURCE_CONTINUE  # check again in 1.5 s
 
     def _debug_report(self):
-        """LOGICLOOM_DEBUG=1: every 2 s, frames each monitor drew and where the waves are."""
+        """SCREENWAVE_DEBUG=1: every 2 s, frames each monitor drew and where the waves are."""
         age = (GLib.get_monotonic_time() - self.start_us) / 1e6
         parts = []
         for view in self.views:
@@ -407,8 +433,8 @@ class Saver(Gtk.Application):
 def offline_scene(args):
     Gtk.init()
     display = Gdk.Display.get_default()
-    s = settings_mod.load()
-    world = world_of(display, s)
+    s = settings_mod.load(Path(args.settings)) if args.settings else settings_mod.load()
+    world = world_of(display, s, all_monitors=getattr(args, "align", False))
     if getattr(args, "align", False):
         return display, AlignScene(world, s)
     return display, Marquee(world, s, only=args.only, seed=args.seed)
@@ -464,9 +490,11 @@ def profile(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Logicloom marquee across every monitor.")
+    p = argparse.ArgumentParser(description="ScreenWave: a marquee across every monitor.")
     p.add_argument("--duration", type=float, default=0, help="quit after N seconds")
     p.add_argument("--only", metavar="NAME", help="show only this animation")
+    p.add_argument("--settings", metavar="INI",
+                   help="use this settings file instead of the saved one (the window's preview)")
     p.add_argument("--align", action="store_true",
                    help="show the line-up pattern; arrow keys move a screen's picture")
     p.add_argument("--snapshot", metavar="PNG", help="render the layout to a PNG and exit")

@@ -1,0 +1,13 @@
+[Unit]
+Description=ScreenWave idle watcher (marquee across your monitors)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+# @HERE@ is replaced with this folder by install.sh / the Enable button
+ExecStart=/usr/bin/python3 "@HERE@/idle_watch.py"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

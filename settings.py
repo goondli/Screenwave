@@ -1,4 +1,4 @@
-"""Logicloom Screensaver settings: ~/.config/logicloom-saver/settings.ini.
+"""ScreenWave settings: ~/.config/screenwave/settings.ini.
 
 Every option is listed once in SPEC (section, default, parser, writer, help
 text). The file is written from SPEC, so the settings window and hand edits
@@ -7,12 +7,15 @@ its default with a warning on stderr: a typo never stops the screensaver.
 """
 import configparser
 import os
+import shutil
 import sys
 from pathlib import Path
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "logicloom-saver"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "screenwave"
 SETTINGS_FILE = CONFIG_DIR / "settings.ini"
 PAUSE_FILE = CONFIG_DIR / "paused"
+# where versions before the rename to ScreenWave kept their settings
+OLD_CONFIG_DIR = CONFIG_DIR.parent / "logicloom-saver"
 
 
 # -- parsers / writers -------------------------------------------------------
@@ -115,7 +118,7 @@ def write_lines(v):
 # key: (section, default, parse, write, help)
 SPEC = {
     # [marquee]
-    "lines": ("marquee", ["LOGICLOOM LLP", "ROBOTICS", "ARTIFICIAL INTELLIGENCE"],
+    "lines": ("marquee", ["YOUR TEXT HERE", "ROBOTICS", "ARTIFICIAL INTELLIGENCE"],
               parse_lines, write_lines,
               "Text that travels across the screens, one wave per line, in turn.\n"
               "Put each line on its own row, indented by a few spaces."),
@@ -148,6 +151,11 @@ SPEC = {
     "match_sizes": ("screens", True, parse_yes, write_yes,
                     "Show things at the same real size on every monitor, even when\n"
                     "their pixels differ (e.g. a 24\" next to 27\"s): yes / no."),
+    "monitors": ("screens", [], parse_names, write_list,
+                 "Monitors to play on, by connector name (e.g. DP-1, HDMI-1, eDP-1).\n"
+                 "Empty = all of them. Names not plugged in are ignored."),
+    "unused_monitors": ("screens", "black", choice("black", "desktop"), write_plain,
+                        "What monitors left out above show: black, or desktop (untouched)."),
     "level": ("screens", "bottoms", choice("bottoms", "centres", "tops", "gnome_layout"),
               write_plain,
               "Which edges of the monitors are level on the desk: bottoms, centres,\n"
@@ -190,8 +198,17 @@ class Settings:
 def load(path=SETTINGS_FILE, warn=None):
     """Read settings, creating the file with defaults if it is missing.
     `warn(msg)` receives every problem; by default they go to stderr."""
-    warn = warn or (lambda m: print(f"logicloom-saver: {m}", file=sys.stderr))
+    warn = warn or (lambda m: print(f"screenwave: {m}", file=sys.stderr))
     s = Settings()
+    if not path.exists() and path == SETTINGS_FILE and (OLD_CONFIG_DIR / "settings.ini").exists():
+        try:  # first start after the rename: carry the old settings over
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(OLD_CONFIG_DIR / "settings.ini", path)
+            if (OLD_CONFIG_DIR / "paused").exists():
+                PAUSE_FILE.touch()
+            warn(f"settings carried over from {OLD_CONFIG_DIR}")
+        except OSError as e:
+            warn(f"could not carry over {OLD_CONFIG_DIR}: {e}")
     if not path.exists():
         try:
             save(s, path)
@@ -230,8 +247,8 @@ def load(path=SETTINGS_FILE, warn=None):
 
 
 def render(s):
-    out = ["# Logicloom Screensaver settings.",
-           "# Change them in the Logicloom Screensaver window, or edit this file:",
+    out = ["# ScreenWave settings.",
+           "# Change them in the ScreenWave window, or edit this file:",
            "# idle_minutes applies at once, the rest the next time it starts.",
            "# A value that can't be read falls back to its default.", ""]
     for section in SECTIONS:

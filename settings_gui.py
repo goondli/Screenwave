@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Logicloom Screensaver: the settings window.
+"""ScreenWave: the settings window.
 
-Every change is saved to ~/.config/logicloom-saver/settings.ini a moment
-after you make it, and the live preview at the top redraws with it.
+Changes show at once in the live preview at the top; Apply saves them to
+~/.config/screenwave/settings.ini (Revert drops them). Enable / Disable
+turn the automatic start on idle on and off.
 """
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,11 +22,11 @@ import settings as S  # noqa: E402
 from marquee import ANIMATIONS_DIR, Marquee, discover  # noqa: E402
 from saver import LayoutPreview, monitors, world_of  # noqa: E402
 
-APP_ID = "in.maridian.LogicloomSaver.Settings"
+APP_ID = "io.github.goondli.ScreenWave"
 HERE = Path(__file__).resolve().parent
-SERVICE = "logicloom-saver.service"
-UNIT_SRC = HERE / SERVICE
+SERVICE = "screenwave.service"
 UNIT_DST = Path.home() / ".config" / "systemd" / "user" / SERVICE
+PREVIEW_INI = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "screenwave-preview.ini"
 
 
 def rgba_of(hex_color):
@@ -39,22 +40,38 @@ def hex_of(c):
 
 
 def systemctl(*args):
-    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    except OSError as e:
+        return 1, str(e)
     return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def unit_text():
+    """The user service, pointing at wherever this folder is."""
+    here = str(HERE).replace("%", "%%")  # % is special in unit files
+    return (HERE / "screenwave.service.in").read_text().replace("@HERE@", here)
+
+
+def monitor_label(name, w, h, wmm, hmm, inches):
+    size = f'{inches:g}"' if inches else (f"{wmm}×{hmm} mm" if wmm else "size unknown")
+    shape = "portrait" if h > w else "landscape"
+    return f"{name}  ·  {size}  ·  {w}×{h} {shape}"
 
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Logicloom Screensaver")
-        self.set_default_size(820, 960)
+        super().__init__(application=app, title="ScreenWave")
+        self.set_default_size(820, 980)
         self.warnings = []
-        self.s = S.load(warn=self.warnings.append)
+        self.saved = S.load(warn=self.warnings.append)  # what is on disk
+        self.s = self.saved.copy()                         # what the window shows
         self.load_errors = {}
         self.anims = discover(errors=self.load_errors)
-        self.world = world_of(Gdk.Display.get_default(), self.s)
-        self._save_id = 0
-        # flush a pending autosave when the window closes
-        self.connect("close-request", lambda *_a: (self._flush(), False)[1])
+        self.display = Gdk.Display.get_default()
+        self.world = world_of(self.display, self.s)
+        self._closing = False
+        self.connect("close-request", self.on_close_request)
         # pick up edits made to the file by hand ("Open settings file")
         self._file_monitor = Gio.File.new_for_path(str(S.SETTINGS_FILE)).monitor_file(
             Gio.FileMonitorFlags.WATCH_MOVES, None)
@@ -63,19 +80,31 @@ class Window(Adw.ApplicationWindow):
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title="ScreenWave")
+        header.set_title_widget(self.title)
         run = Gtk.Button(label="Preview on screens")
-        run.add_css_class("suggested-action")
-        run.set_tooltip_text("Start the screensaver now on all monitors. Move the mouse to stop.")
+        run.set_tooltip_text("Play it now on the monitors with the settings shown here, "
+                             "applied or not. Move the mouse to stop.")
         run.connect("clicked", self.on_run)
         header.pack_start(run)
         menu = Gio.Menu()
         menu.append("Open settings file", "win.open-file")
         menu.append("Reset to defaults…", "win.reset")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        self.apply_btn = Gtk.Button(label="Apply")
+        self.apply_btn.add_css_class("suggested-action")
+        self.apply_btn.set_tooltip_text("Save these settings; the screensaver uses them from "
+                                        "its next start")
+        self.apply_btn.connect("clicked", lambda *_: self.apply())
+        header.pack_end(self.apply_btn)
+        self.revert_btn = Gtk.Button(label="Revert")
+        self.revert_btn.set_tooltip_text("Drop the changes made since the last Apply")
+        self.revert_btn.connect("clicked", lambda *_: self.revert())
+        header.pack_end(self.revert_btn)
         view.add_top_bar(header)
 
         self.preview = LayoutPreview()
-        self.preview.set_size_request(-1, 210)
+        self.preview.set_size_request(-1, 200)
         frame = Gtk.Frame(margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
         frame.set_child(self.preview)
 
@@ -95,32 +124,68 @@ class Window(Adw.ApplicationWindow):
 
         self.build()
         self.rebuild_preview()
+        self.update_dirty()
         for w in self.warnings:
             self.toast(w)
 
-    # -- helpers ------------------------------------------------------------
+    # -- state ----------------------------------------------------------------
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=4))
 
-    def changed(self, *_):
-        """Called by every control: save shortly, refresh the preview now."""
-        self.rebuild_preview()
-        if self._save_id:
-            GLib.source_remove(self._save_id)
-        self._save_id = GLib.timeout_add(400, self.save_now)
+    def dirty(self):
+        return S.render(self.s) != S.render(self.saved)
 
-    def save_now(self):
-        self._save_id = 0
+    def update_dirty(self):
+        d = self.dirty()
+        self.apply_btn.set_sensitive(d)
+        self.revert_btn.set_sensitive(d)
+        self.title.set_subtitle("Changes not applied yet" if d else "All changes applied")
+
+    def changed(self, *_):
+        """Called by every control: preview now, mark unapplied."""
+        self.rebuild_preview()
+        self.update_dirty()
+
+    def apply(self):
         try:
             S.save(self.s)
         except OSError as e:
             self.toast(f"Could not save: {e}")
-        return GLib.SOURCE_REMOVE
+            return False
+        self.saved = self.s.copy()
+        self.update_dirty()
+        self.toast("Applied. The screensaver uses these settings from its next start.")
+        return True
 
-    def _flush(self):
-        if self._save_id:
-            GLib.source_remove(self._save_id)
-            self.save_now()
+    def revert(self):
+        self.s = self.saved.copy()
+        self.build()
+        self.rebuild_preview()
+        self.update_dirty()
+        self.toast("Changes dropped")
+
+    def on_close_request(self, *_):
+        if self._closing or not self.dirty():
+            return False
+        dlg = Adw.AlertDialog(heading="Apply your changes?",
+                              body="Some changes are not applied yet. Without Apply the "
+                                   "screensaver keeps the old settings.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("discard", "Close without applying")
+        dlg.add_response("apply", "Apply and close")
+        dlg.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("apply")
+
+        def done(d, result):
+            answer = d.choose_finish(result)
+            if answer == "apply" and not self.apply():
+                return
+            if answer in ("apply", "discard"):
+                self._closing = True
+                self.close()
+        dlg.choose(self, None, done)
+        return True  # stay open until answered
 
     def on_file_changed(self, _mon, _file, _other, event):
         if event not in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
@@ -130,26 +195,28 @@ class Window(Adw.ApplicationWindow):
             text = S.SETTINGS_FILE.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
-        if text == S.render(self.s):
-            return  # our own save
-        self._flush_pending_cancel()
-        self.s = S.load(warn=self.toast)
+        if text == S.render(self.saved):
+            return  # our own Apply
+        had_changes = self.dirty()
+        self.saved = S.load(warn=self.toast)
+        if had_changes:
+            self.update_dirty()
+            self.toast("The settings file changed outside this window. Revert loads it; "
+                       "Apply replaces it with what is shown here.")
+            return
+        self.s = self.saved.copy()
         self.build()
         self.rebuild_preview()
+        self.update_dirty()
         self.toast("Settings file changed outside this window: reloaded")
-
-    def _flush_pending_cancel(self):
-        # the file on disk is newer than our pending edit: drop the edit
-        if self._save_id:
-            GLib.source_remove(self._save_id)
-            self._save_id = 0
 
     def rebuild_preview(self):
         # screen settings change the layout itself
-        self.world = world_of(Gdk.Display.get_default(), self.s)
+        self.world = world_of(self.display, self.s)
         # quiet: the page already shows a "Not found" row for missing files
         self.preview.set_scene(Marquee(self.world, self.s.copy(), animations=self.anims, quiet=True))
 
+    # -- control helpers --------------------------------------------------------
     def spin(self, group, title, subtitle, key, lo, hi, step, digits=0):
         # the settings file's own limits win, so every valid value shows
         parse = S.SPEC[key][2]
@@ -183,9 +250,11 @@ class Window(Adw.ApplicationWindow):
         row.set_activatable_widget(btn)
         group.add(row)
 
-    def combo(self, group, title, key, options):
+    def combo(self, group, title, key, options, subtitle=None):
         """options: [(value, label)]"""
         row = Adw.ComboRow(title=title, model=Gtk.StringList.new([lbl for _v, lbl in options]))
+        if subtitle:
+            row.set_subtitle(subtitle)
         values = [v for v, _l in options]
         row.set_selected(values.index(getattr(self.s, key)) if getattr(self.s, key) in values else 0)
 
@@ -208,6 +277,32 @@ class Window(Adw.ApplicationWindow):
             self.page.add(g)
             self._groups.append(g)
             return g
+
+        # on / off
+        g = group("Screensaver")
+        self.state_row = Adw.ActionRow()
+        self.enable_btn = Gtk.Button(label="Enable", valign=Gtk.Align.CENTER)
+        self.enable_btn.add_css_class("suggested-action")
+        self.enable_btn.connect("clicked", lambda *_: self.set_enabled(True))
+        self.disable_btn = Gtk.Button(label="Disable", valign=Gtk.Align.CENTER)
+        self.disable_btn.add_css_class("destructive-action")
+        self.disable_btn.connect("clicked", lambda *_: self.set_enabled(False))
+        self.state_row.add_suffix(self.enable_btn)
+        self.state_row.add_suffix(self.disable_btn)
+        g.add(self.state_row)
+        self.show_state()
+
+        # monitors
+        g = group("Monitors", "Choose the monitors it plays on: one, two, three, four or more.")
+        self.monitor_names = [info[0] for _m, info in monitors(self.display)]
+        chosen = self.chosen_monitors()
+        for _mon, (name, _x, _y, w, h, wmm, hmm, inches) in monitors(self.display):
+            row = Adw.SwitchRow(title=monitor_label(name, w, h, wmm, hmm, inches))
+            row.set_active(name in chosen)
+            row.connect("notify::active", self.on_monitor_toggle, name)
+            g.add(row)
+        self.combo(g, "Monitors left out", "unused_monitors",
+                   [("black", "Go black"), ("desktop", "Keep showing the desktop")])
 
         # text
         g = group("Marquee text", "Each line travels across the screens as one wave, in turn.")
@@ -284,10 +379,10 @@ class Window(Adw.ApplicationWindow):
             buttons.append(b)
         g.add(buttons)
 
-        # screens
-        g = group("Screens", "Monitors of different sizes show everything at the same real "
-                  "height. If one is mounted higher or lower, line them up.")
-        row = Adw.SwitchRow(title="Same size on every screen",
+        # sizes and heights
+        g = group("Sizes and heights", "Monitors of different sizes show everything at the same "
+                  "real size and height. If one is mounted higher or lower, line them up.")
+        row = Adw.SwitchRow(title="Same size on every monitor",
                             subtitle="Zoom smaller-pixel monitors to match the others")
         row.set_active(self.s.match_sizes)
 
@@ -298,12 +393,12 @@ class Window(Adw.ApplicationWindow):
         g.add(row)
         self.combo(g, "Monitors are level at", "level",
                    [("bottoms", "Bottom edges"), ("centres", "Centres"), ("tops", "Top edges"),
-                    ("gnome_layout", "As in GNOME display settings")])
-        for _mon, (name, _x, _y, w, h, wmm, hmm, inches) in monitors(Gdk.Display.get_default()):
-            size = f'{inches:g}"' if inches else (f"{wmm}x{hmm} mm" if wmm else "size unknown")
+                    ("gnome_layout", "As in the display settings")],
+                   subtitle="Side-by-side monitors only; stacked ones follow the display settings")
+        for _mon, (name, _x, _y, w, h, wmm, hmm, inches) in monitors(self.display):
             spin = Adw.SpinRow.new_with_range(-500, 500, 1)
-            spin.set_title(f"{name}  ·  {size}  ·  {w}x{h}")
-            spin.set_subtitle("Move this screen's picture up (+) or down (-), in mm")
+            spin.set_title(monitor_label(name, w, h, wmm, hmm, inches))
+            spin.set_subtitle("Move this monitor's picture up (+) or down (-), in mm")
             spin.set_digits(1)
             spin.set_value(self.s.screen_shift.get(name, 0.0))
 
@@ -317,19 +412,13 @@ class Window(Adw.ApplicationWindow):
             spin.connect("notify::value", on_shift)
             g.add(spin)
         align = Adw.ButtonRow(title="Line up screens…", start_icon_name="view-grid-symbolic")
-        align.set_tooltip_text("Shows lines across all screens. Point at a screen, press "
+        align.set_tooltip_text("Shows lines across all monitors. Point at one, press "
                                "Up/Down until the lines run straight, then Enter.")
         align.connect("activated", self.on_align)
         g.add(align)
 
         # running
         g = group("When it runs")
-        self.auto_row = Adw.SwitchRow(
-            title="Start automatically",
-            subtitle="Show the screensaver after the idle time below")
-        self.auto_row.set_active(systemctl("is-enabled", SERVICE)[1] == "enabled")
-        self.auto_row.connect("notify::active", self.on_auto)
-        g.add(self.auto_row)
         self.spin(g, "Start after", "Minutes without keyboard or mouse", "idle_minutes",
                   0.5, 1440, 0.5, digits=1)
         self.spin(g, "Play for", "Minutes, then the screens fade to black; 0 = until you move",
@@ -337,6 +426,25 @@ class Window(Adw.ApplicationWindow):
         self.color(g, "Background", "background")
         self.spin(g, "Frame rate limit", "Frames per second on fast screens; lower uses less CPU",
                   "fps", 10, 240, 6)
+
+    # -- monitors ----------------------------------------------------------------
+    def chosen_monitors(self):
+        present = [n for n in self.monitor_names]
+        picked = [n for n in self.s.monitors if n in present]
+        return picked or present  # nothing chosen (or none plugged in) = all
+
+    def on_monitor_toggle(self, row, _p, name):
+        chosen = [n for n in self.chosen_monitors() if n != name]
+        if row.get_active():
+            chosen.append(name)
+        if not chosen:
+            self.toast("Keep at least one monitor")
+            row.set_active(True)
+            return
+        # keep the display order; all of them is stored as "all" (empty)
+        chosen = [n for n in self.monitor_names if n in chosen]
+        self.s.monitors = [] if len(chosen) == len(self.monitor_names) else chosen
+        self.changed()
 
     # -- lines ------------------------------------------------------------------
     def add_line_row(self, text):
@@ -456,48 +564,82 @@ class Window(Adw.ApplicationWindow):
             self.on_reload()
             self.changed()
             Gtk.FileLauncher.new(Gio.File.new_for_path(str(path))).launch(self, None, None)
-            self.toast(f"Created animations/{path.name}")
+            self.toast(f"Created animations/{path.name}. Apply to keep it switched on.")
         dlg.choose(self, None, done)
 
-    # -- running ------------------------------------------------------------------
-    def on_auto(self, row, _p):
-        if row.get_active():
-            UNIT_DST.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(UNIT_SRC, UNIT_DST)
+    # -- enable / disable ---------------------------------------------------------
+    def is_enabled(self):
+        return systemctl("is-enabled", SERVICE)[1] == "enabled"
+
+    def show_state(self):
+        on = self.is_enabled()
+        running = systemctl("is-active", SERVICE)[1] == "active"
+        self.state_row.set_title("On" if on else "Off")
+        self.state_row.set_subtitle(
+            f"Starts after {self.saved.idle_minutes:g} min without keyboard or mouse"
+            + ("" if running or not on else " (watcher not running: press Enable again)")
+            if on else "Never starts by itself. Preview on screens still works.")
+        self.enable_btn.set_sensitive(not on or not running)
+        self.disable_btn.set_sensitive(on or running)
+
+    def set_enabled(self, on):
+        if on:
+            try:
+                UNIT_DST.parent.mkdir(parents=True, exist_ok=True)
+                UNIT_DST.write_text(unit_text())
+            except OSError as e:
+                self.toast(f"Could not install the service: {e}")
+                return
             systemctl("daemon-reload")
-            code, out = systemctl("enable", "--now", SERVICE)
+            code, out = systemctl("enable", SERVICE)
+            if code == 0:
+                code, out = systemctl("restart", SERVICE)
         else:
             code, out = systemctl("disable", "--now", SERVICE)
         if code != 0:
             self.toast(f"systemctl failed: {out}")
+        self.show_state()
+        if code == 0:
+            self.toast("Enabled: it starts after the idle time" if on else "Disabled")
 
+    # -- running ------------------------------------------------------------------
     def on_align(self, *_):
         """Line-up pattern on the real screens; afterwards read back what it saved."""
-        self.save_now()
         proc = Gio.Subprocess.new([sys.executable, str(HERE / "saver.py"), "--align"],
                                   Gio.SubprocessFlags.NONE)
 
         def done(p, result):
             p.wait_finish(result)
-            self.s.screen_shift = S.load(warn=lambda m: None).screen_shift
+            shift = S.load(warn=lambda m: None).screen_shift
+            # line-up saves straight away (Enter); keep the rest of the edits
+            self.s.screen_shift = dict(shift)
+            self.saved.screen_shift = dict(shift)
             self.build()
             self.rebuild_preview()
-            shifts = S.write_per_screen(self.s.screen_shift) or "none"
-            self.toast(f"Screen positions: {shifts}")
+            self.update_dirty()
+            self.toast(f"Screen positions: {S.write_per_screen(shift) or 'none'}")
         proc.wait_async(None, done)
 
     def on_run(self, *_):
-        self.save_now()
-        subprocess.Popen([sys.executable, str(HERE / "saver.py")], start_new_session=True)
+        """Play now with what the window shows, applied or not."""
+        try:
+            S.save(self.s, PREVIEW_INI)
+        except OSError as e:
+            self.toast(f"Could not start the preview: {e}")
+            return
+        subprocess.Popen([sys.executable, str(HERE / "saver.py"), "--settings", str(PREVIEW_INI)],
+                         start_new_session=True)
 
     def on_open_file(self, *_):
-        self.save_now()
+        if not S.SETTINGS_FILE.exists():
+            S.save(self.saved)
         Gtk.FileLauncher.new(Gio.File.new_for_path(str(S.SETTINGS_FILE))).launch(self, None, None)
 
     def on_reset(self, *_):
         dlg = Adw.AlertDialog(heading="Reset to defaults?",
-                              body="All settings go back to how they started. Your animation "
-                                   "files are not touched.")
+                              body="The window goes back to the starting settings. Nothing "
+                                   "changes until you press Apply. Animation files are not "
+                                   "touched.")
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("reset", "Reset")
         dlg.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -505,10 +647,10 @@ class Window(Adw.ApplicationWindow):
         def done(d, result):
             if d.choose_finish(result) == "reset":
                 self.s = S.Settings()
-                self.save_now()
                 self.build()
                 self.rebuild_preview()
-                self.toast("Settings reset")
+                self.update_dirty()
+                self.toast("Defaults loaded: press Apply to keep them")
         dlg.choose(self, None, done)
 
 

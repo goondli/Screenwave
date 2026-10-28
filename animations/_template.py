@@ -1,8 +1,8 @@
 """Starting point for your own animation.
 
 Copy this file to a new name in this folder (no leading underscore), e.g.
-animations/ai_chip.py, change NAME, and it appears in the Logicloom
-Screensaver window under Animations. See kit.py for everything `pen` can
+animations/ai_chip.py, change NAME, and it appears in the ScreenWave
+window under Animations. See kit.py for everything `pen` can
 draw and what `wave` tells you.
 
 This example: an "AI chip" that travels in front of the text, with pins
