@@ -210,7 +210,6 @@ class Wave:
 
 
 # -- the pen ---------------------------------------------------------------------
-_strokes = {}
 _layouts = {}
 _pango_ctx = None
 
@@ -238,15 +237,32 @@ def text_layout(text, size, font="Ubuntu Bold"):
     return lay
 
 
-def _stroke(width, round_cap=True):
-    key = (round(width, 2), round_cap)
-    st = _strokes.get(key)
+# Why no Gsk paths for lines and circles: GTK's renderer rasterises every new
+# path on the CPU each frame. Measured live, the neural animation took 67% of
+# a core with paths. Rotated rectangles and radial gradients are drawn by the
+# GPU, so line/lines/circle/ring use those; only polygon() still needs a path.
+_shape_stops = {}
+
+
+def _ring_stops(color, alpha, radii, outer):
+    """Cached stops for a radial gradient of radius `outer` that is opaque
+    between radii[1] and radii[2] and fades out over radii[0]..[1] and
+    radii[2]..[3]."""
+    ckey = color if isinstance(color, str) else tuple(round(c, 3) for c in color)
+    key = (ckey, round(alpha, 3), tuple(round(p / outer, 3) for p in radii))
+    st = _shape_stops.get(key)
     if st is None:
-        st = Gsk.Stroke.new(max(0.1, width))
-        if round_cap:
-            st.set_line_cap(Gsk.LineCap.ROUND)
-            st.set_line_join(Gsk.LineJoin.ROUND)
-        _strokes[key] = st
+        if len(_shape_stops) > 4096:
+            _shape_stops.clear()
+        clear, solid = rgba(color, 0), rgba(color, alpha)
+        offs = []
+        last = 0.0
+        for p in radii:  # offsets must never go backwards
+            last = max(last, min(1.0, p / outer))
+            offs.append(last)
+        st = stops((0.0, solid if offs[0] <= 0 else clear), (offs[0], clear if offs[0] > 0 else solid),
+                   (offs[1], solid), (offs[2], solid), (offs[3], clear))
+        _shape_stops[key] = st
     return st
 
 
@@ -278,18 +294,25 @@ class Pen:
         if alpha > 0.002 and self.visible(x, y, x + w, y + h):
             self.snap.append_color(rgba(color, alpha), grect(x, y, w, h))
 
+    def _radial(self, x, y, outer, st):
+        self.snap.append_radial_gradient(grect(x - outer, y - outer, 2 * outer, 2 * outer),
+                                         gpoint(x, y), outer, outer, 0.0, 1.0, st)
+
     def circle(self, x, y, r, color, alpha=1.0):
         if alpha > 0.002 and r > 0 and self.visible(x - r, y - r, x + r, y + r):
-            b = Gsk.PathBuilder.new()
-            b.add_circle(gpoint(x, y), r)
-            self.snap.append_fill(b.to_path(), Gsk.FillRule.WINDING, rgba(color, alpha))
+            outer = r + 0.5  # half a pixel of soft edge each side of r
+            self._radial(x, y, outer, _ring_stops(color, alpha, (0, 0, r - 0.5, outer), outer))
 
     def ring(self, x, y, r, width, color, alpha=1.0):
         if alpha > 0.002 and r > 0 and self.visible(x - r - width, y - r - width,
                                                     x + r + width, y + r + width):
-            b = Gsk.PathBuilder.new()
-            b.add_circle(gpoint(x, y), r)
-            self.snap.append_stroke(b.to_path(), _stroke(width), rgba(color, alpha))
+            inner, outer = max(0.0, r - width / 2), r + width / 2 + 0.5
+            if width < 1:  # hairline: thinner by fading rather than by pixels
+                alpha *= width
+                width = 1.0
+                inner = max(0.0, r - 0.5)
+            radii = (max(0.0, inner - 0.5), inner + 0.5, r + width / 2 - 0.5, outer)
+            self._radial(x, y, outer, _ring_stops(color, alpha, radii, outer))
 
     def glow(self, x, y, r, color, alpha=0.5):
         """Soft light, brightest in the middle."""
@@ -299,13 +322,27 @@ class Pen:
                 stops((0.0, rgba(color, alpha)), (0.35, rgba(color, alpha * 0.45)),
                       (1.0, rgba(color, 0))))
 
+    def _segment(self, x1, y1, x2, y2, width, c, ext1, ext2):
+        """A rotated rectangle from (x1,y1) to (x2,y2), lengthened by ext1
+        before the start and ext2 past the end."""
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 1e-3:
+            return
+        snap = self.snap
+        snap.save()
+        snap.translate(gpoint(x1, y1))
+        snap.rotate(math.degrees(math.atan2(dy, dx)))
+        snap.append_color(c, grect(-ext1, -width / 2, length + ext1 + ext2, width))
+        snap.restore()
+
     def line(self, x1, y1, x2, y2, width, color, alpha=1.0):
         if alpha > 0.002 and self.visible(min(x1, x2) - width, min(y1, y2) - width,
                                           max(x1, x2) + width, max(y1, y2) + width):
-            b = Gsk.PathBuilder.new()
-            b.move_to(x1, y1)
-            b.line_to(x2, y2)
-            self.snap.append_stroke(b.to_path(), _stroke(width), rgba(color, alpha))
+            self._segment(x1, y1, x2, y2, width, rgba(color, alpha), 0, 0)
+            if alpha >= 0.99 and width >= 3:  # round ends; invisible overlap when opaque
+                self.circle(x1, y1, width / 2, color)
+                self.circle(x2, y2, width / 2, color)
 
     def lines(self, points, width, color, alpha=1.0, closed=False):
         """A connected line through [(x, y), ...]."""
@@ -315,13 +352,17 @@ class Pen:
         ys = [p[1] for p in points]
         if not self.visible(min(xs) - width, min(ys) - width, max(xs) + width, max(ys) + width):
             return
-        b = Gsk.PathBuilder.new()
-        b.move_to(*points[0])
-        for p in points[1:]:
-            b.line_to(*p)
-        if closed:
-            b.close()
-        self.snap.append_stroke(b.to_path(), _stroke(width), rgba(color, alpha))
+        pts = list(points) + ([points[0]] if closed else [])
+        c = rgba(color, alpha)
+        # Opaque: overlap the joints by half the width so corners are filled.
+        # See-through: don't, or every joint would show as a brighter dot.
+        joint = width / 2 if alpha >= 0.99 else 0.0
+        for i in range(len(pts) - 1):
+            self._segment(*pts[i], *pts[i + 1], width, c, joint if i else 0,
+                          joint if i < len(pts) - 2 else 0)
+        if alpha >= 0.99 and width >= 3 and not closed:
+            self.circle(*pts[0], width / 2, color)
+            self.circle(*pts[-1], width / 2, color)
 
     def polygon(self, points, color, alpha=1.0):
         """A filled shape through [(x, y), ...]."""
