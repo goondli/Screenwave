@@ -30,7 +30,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gsk", "4.0")
-from gi.repository import Gdk, GLib, Gsk, Gtk  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gsk, Gtk  # noqa: E402
 
 import settings as settings_mod  # noqa: E402
 from kit import Pen, gpoint, grect, physical_world, rgba  # noqa: E402
@@ -91,6 +91,26 @@ def draw_layout(snap, scene, scale, gaps=(0.16, 0.16, 0.18)):
     snap.restore()
 
 
+def _meeting_points(a, b, world, slack=60):
+    """Centres of the edges where screens a and b meet (side by side or one
+    above the other), allowing a small gap; [] if they don't meet."""
+    out = []
+    across = (max(a.y, b.y), min(a.y1, b.y1))  # shared height
+    along = (max(a.x, b.x), min(a.x1, b.x1))   # shared width
+    if across[1] - across[0] > 0:
+        for x_a, x_b in ((a.x1, b.x), (b.x1, a.x)):
+            if abs(x_a - x_b) <= slack:
+                lo = max(across[0], world.band_top)
+                hi = min(across[1], world.band_bottom)
+                y = (lo + hi) / 2 if hi > lo else sum(across) / 2
+                out.append(((x_a + x_b) / 2, y))
+    if along[1] - along[0] > 0:
+        for y_a, y_b in ((a.y1, b.y), (b.y1, a.y)):
+            if abs(y_a - y_b) <= slack:
+                out.append((sum(along) / 2, (y_a + y_b) / 2))
+    return out
+
+
 class AlignScene:
     """Pattern for lining the monitors up: straight lines every 30 mm and a
     circle on each place two monitors meet. If a monitor sits higher or lower
@@ -123,13 +143,14 @@ class AlignScene:
             major = round(y / step) % 3 == 0
             pen.line(w.x0, y, w.x1, y, 3 if major else 1.5, "#4dd9ff", 0.9 if major else 0.45)
             y += step
-        mid = (w.band_top + w.band_bottom) / 2
-        for a, b in zip(w.screens, w.screens[1:]):
-            edge = (a.x1 + b.x) / 2
-            r = 120 / self.unit_mm()
-            pen.ring(edge, mid, r, 6, "#ffcc4d")
-            pen.line(edge - r, mid - r, edge + r, mid + r, 4, "#ff7359")
-            pen.line(edge - r, mid + r, edge + r, mid - r, 4, "#ff7359")
+        # a circle with a cross on every place two monitors meet
+        r = 120 / self.unit_mm()
+        for i, a in enumerate(w.screens):
+            for b in w.screens[i + 1:]:
+                for cx, cy in _meeting_points(a, b, w):
+                    pen.ring(cx, cy, r, 6, "#ffcc4d")
+                    pen.line(cx - r, cy - r, cx + r, cy + r, 4, "#ff7359")
+                    pen.line(cx - r, cy + r, cx + r, cy - r, 4, "#ff7359")
         shift = self.s.screen_shift
         for scr in w.screens:
             on = scr.name == self.active
@@ -193,8 +214,14 @@ class LayoutPreview(Gtk.Widget):
 
 class Saver(Gtk.Application):
     def __init__(self, args):
-        super().__init__(application_id=APP_ID)
+        # Only the idle-started screensaver is single-instance. A preview or a
+        # line-up from the window must always open, even while another runs.
+        one_off = bool(args.settings or args.align or args.duration)
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.NON_UNIQUE if one_off
+                         else Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.args = args
+        self.exit_status = 0
         self.scene = None
         self.windows = []
         self.views = []
@@ -251,6 +278,7 @@ class Saver(Gtk.Application):
         view.set_cursor_from_name("none")
         win.set_child(view)
         self._quit_on_input(win, name)
+        win.connect("map", lambda *_a: print(f"black window shown on {name} (left out)", flush=True))
         win.fullscreen_on_monitor(mon)
         win.present()
         self.windows.append(win)
@@ -294,6 +322,7 @@ class Saver(Gtk.Application):
             elif k in ("Return", "KP_Enter"):
                 self._align_save()
             elif k == "Escape":
+                self.exit_status = 3
                 self._quit("line-up cancelled")
             return True
 
@@ -302,9 +331,14 @@ class Saver(Gtk.Application):
         win.add_controller(keys)
 
     def _align_save(self):
-        fresh = settings_mod.load()  # keep anything else changed meanwhile
+        """Enter: write the positions back to the settings file in use (the
+        window's preview file when started from the window, which then shows
+        them as an unapplied change). Exit status 0 = saved, 3 = cancelled."""
+        path = Path(self.args.settings) if self.args.settings else settings_mod.SETTINGS_FILE
+        fresh = settings_mod.load(path)  # keep anything else changed meanwhile
         fresh.screen_shift = dict(self.settings.screen_shift)
-        settings_mod.save(fresh)
+        settings_mod.save(fresh, path)
+        self.exit_status = 0
         self._quit(f"saved screen_shift {settings_mod.write_per_screen(fresh.screen_shift)}")
 
     def _shift(self, name, delta):
@@ -315,7 +349,7 @@ class Saver(Gtk.Application):
             shift[name] = round(shift.get(name, 0.0) + delta, 1)
             if shift[name] == 0:
                 del shift[name]
-        world = world_of(Gdk.Display.get_default(), self.settings)
+        world = world_of(Gdk.Display.get_default(), self.settings, all_monitors=True)
         self.scene.world = world
         by_name = {sc.name: sc for sc in world.screens}
         for view in self.views:
@@ -517,7 +551,9 @@ def main():
         if args.at == 8.0:
             args.at = 60.0
         return profile(args)
-    return Saver(args).run([sys.argv[0]])
+    app = Saver(args)
+    status = app.run([sys.argv[0]])
+    return status or (app.exit_status if args.align else 0)
 
 
 if __name__ == "__main__":

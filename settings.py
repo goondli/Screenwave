@@ -7,7 +7,6 @@ its default with a warning on stderr: a typo never stops the screensaver.
 """
 import configparser
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -201,12 +200,17 @@ def load(path=SETTINGS_FILE, warn=None):
     warn = warn or (lambda m: print(f"screenwave: {m}", file=sys.stderr))
     s = Settings()
     if not path.exists() and path == SETTINGS_FILE and (OLD_CONFIG_DIR / "settings.ini").exists():
-        try:  # first start after the rename: carry the old settings over
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(OLD_CONFIG_DIR / "settings.ini", path)
+        # First start after the rename: read the old settings, write them in
+        # the new format (every option, ScreenWave header), then rename the
+        # old folder so this happens once only.
+        old = load(OLD_CONFIG_DIR / "settings.ini", warn)
+        try:
+            save(old, path)
             if (OLD_CONFIG_DIR / "paused").exists():
                 PAUSE_FILE.touch()
-            warn(f"settings carried over from {OLD_CONFIG_DIR}")
+            OLD_CONFIG_DIR.rename(OLD_CONFIG_DIR.with_name("logicloom-saver.migrated"))
+            warn(f"settings carried over from {OLD_CONFIG_DIR} (now logicloom-saver.migrated)")
+            return old
         except OSError as e:
             warn(f"could not carry over {OLD_CONFIG_DIR}: {e}")
     if not path.exists():

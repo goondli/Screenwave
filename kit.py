@@ -214,43 +214,106 @@ def physical_world(monitors, match_sizes=True, shift_mm=None, inches=None, level
     known = [v for v in mm.values() if v]
     ref = max(known) if (match_sizes and known) else None
 
-    def units_per_px(name):
-        return (mm[name] / ref) if (ref and mm[name]) else 1.0
+    mons = {m[0]: m for m in monitors}
+    k = {n: (mm[n] / ref) if (ref and mm[n]) else 1.0 for n in mons}  # scene units per px
 
-    ordered = sorted(monitors, key=lambda m: (m[1], m[2]))
-    # stacked: two monitors share some width, so one is above the other
-    stacked = any(min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]) > 10
-                  for i, a in enumerate(ordered) for b in ordered[i + 1:])
-    if stacked:
-        level = "gnome_layout"
-    tallest = max(h * units_per_px(n) for n, _x, _y, _w, h, *_r in monitors)
-    placed = []  # (layout tuple, Screen)
-    for mon in ordered:
-        name, x, y, w, h, _wmm, _hmm = mon
-        k = units_per_px(name)  # scene units per pixel
-        sx, sy = float(x), float(y)
-        if level == "bottoms":
-            sy = tallest - h * k
-        elif level == "centres":
-            sy = (tallest - h * k) / 2
-        elif level == "tops":
-            sy = 0.0
-        for (_n, px, py, pw, ph, *_r), prev in placed:
-            if abs(px + pw - x) <= 1 and py < y + h and y < py + ph:  # left neighbour
-                sx = prev.x1
-                if level == "gnome_layout":  # keep the layout's offset, in scene units
-                    sy = prev.y + (y - py) * prev.h / ph
-            elif abs(py + ph - y) <= 1 and px < x + w and x < px + pw:  # neighbour above
-                sy = prev.y1
-                sx = prev.x + (x - px) * prev.w / pw
-        unit_mm = ref or mm[name] or 0.265  # mm per scene unit, for shift
-        sy += shift_mm.get(name, 0.0) / unit_mm
-        placed.append((mon, Screen(sx, sy, w * k, h * k, name, scale=1 / k)))
-    screens = [s for _m, s in placed]
+    stacked = {n for n in mons for o in mons
+               if o != n and _touch(mons[n], mons[o]) and _touch(mons[n], mons[o])[0] in ("above", "below")}
+    row = [n for n in mons if n not in stacked]
+    tallest = max((mons[n][4] * k[n] for n in row), default=0.0)
+
+    def y_for(n, from_layout):
+        """Side-by-side monitors stand on the chosen level; a monitor with
+        another directly above or below it keeps the layout's height."""
+        if level == "gnome_layout" or n in stacked:
+            return from_layout
+        h = mons[n][4] * k[n]
+        return {"bottoms": tallest - h, "centres": (tallest - h) / 2}.get(level, 0.0)
+
+    # Place outwards from the top-left monitor: each next monitor is the one
+    # sharing the longest edge with one already placed, and is attached to
+    # that edge, in whichever direction it lies.
+    first = min(mons.values(), key=lambda m: (m[1], m[2]))[0]
+    rects = {first: [float(mons[first][1]), y_for(first, float(mons[first][2])),
+                     mons[first][3] * k[first], mons[first][4] * k[first]]}
+    order = [first]
+    while len(rects) < len(mons):
+        best = None
+        for n in mons:
+            if n in rects:
+                continue
+            for p in rects:
+                t = _touch(mons[p], mons[n])
+                if t and (best is None or t[1] > best[3]):
+                    best = (n, p, t[0], t[1])
+        if best is None:  # not touching anything placed: use its layout position
+            n = min((m for m in mons.values() if m[0] not in rects), key=lambda m: (m[1], m[2]))[0]
+            _n, x, y, w, h, *_r = mons[n]
+            rects[n] = [float(x), y_for(n, float(y)), w * k[n], h * k[n]]
+            order.append(n)
+            continue
+        n, p, side, _len = best
+        _n, x, y, w, h, *_r = mons[n]
+        _p, px, py, *_r = mons[p]
+        X, Y, W, H = rects[p]
+        kp = k[p]
+        if side in ("right", "left"):
+            sx = X + W if side == "right" else X - w * k[n]
+            sy = y_for(n, Y + (y - py) * kp)
+        else:
+            sy = Y + H if side == "below" else Y - h * k[n]
+            sx = X + (x - px) * kp
+        rects[n] = [sx, sy, w * k[n], h * k[n]]
+        order.append(n)
+
+    # Mixed sizes can still make two scene rectangles overlap (a 24" in a
+    # grid of 27"s): push the later one out the shorter way.
+    for _round in range(len(order) * 4):
+        moved = False
+        for i, n in enumerate(order):
+            a = rects[n]
+            for o in order[:i]:
+                b = rects[o]
+                dx = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                dy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                if dx > 0.5 and dy > 0.5:
+                    if dx <= dy:
+                        a[0] += dx if a[0] >= b[0] else -dx
+                    else:
+                        a[1] += dy if a[1] >= b[1] else -dy
+                    moved = True
+        if not moved:
+            break
+
+    # Shifts last, so each one moves only its own monitor.
+    unit_mm = ref or (max(known) if known else 0.265)  # mm per scene unit
+    screens = []
+    for n in order:
+        sx, sy, sw, sh = rects[n]
+        own_mm = unit_mm if ref else (mm[n] or 0.265)
+        screens.append(Screen(sx, sy + shift_mm.get(n, 0.0) / own_mm, sw, sh, n, scale=1 / k[n]))
     kept = [s for s in screens if s.name in use] if use else []
     world = World(kept or screens)
-    world.unit_mm = ref or (max(known) if known else 0.265)
+    world.unit_mm = unit_mm
     return world
+
+
+def _touch(a, b):
+    """Where monitor b lies against monitor a in the layout, and the length
+    of the edge they share: ("right" | "left" | "below" | "above", px) or None."""
+    _a, ax, ay, aw, ah, *_r = a
+    _b, bx, by, bw, bh, *_r = b
+    across = min(ay + ah, by + bh) - max(ay, by)   # shared height
+    along = min(ax + aw, bx + bw) - max(ax, bx)    # shared width
+    if across > 0 and abs(ax + aw - bx) <= 1:
+        return "right", across
+    if across > 0 and abs(bx + bw - ax) <= 1:
+        return "left", across
+    if along > 0 and abs(ay + ah - by) <= 1:
+        return "below", along
+    if along > 0 and abs(by + bh - ay) <= 1:
+        return "above", along
+    return None
 
 
 # -- a wave: one line of text plus one animation crossing the screens ---------

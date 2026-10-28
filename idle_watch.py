@@ -64,6 +64,8 @@ class IdleWatcher:
         self.watch_id = None
         if not self.poll_id:
             log(f"no {IDLE_BUS}: polling {FD_BUS} for idle time instead")
+            self.idle_ms = int(S.load().idle_minutes * 60_000)
+            self.poll_failing = False
             self.poll_id = GLib.timeout_add_seconds(5, self._poll)
 
     def _poll(self):
@@ -71,10 +73,14 @@ class IdleWatcher:
         try:
             (idle_ms,) = self._call(FD_BUS, FD_PATH, FD_BUS, "GetSessionIdleTime")
         except GLib.Error as e:
-            log(f"cannot read the idle time ({e.message}); trying again in 5 s")
+            if not self.poll_failing:  # say it once, not every 5 s
+                log(f"cannot read the idle time ({e.message}); will keep trying")
+                self.poll_failing = True
             return GLib.SOURCE_CONTINUE
-        threshold = int(S.load().idle_minutes * 60_000)
-        if idle_ms < threshold:
+        if self.poll_failing:
+            log("reading the idle time works again")
+            self.poll_failing = False
+        if idle_ms < self.idle_ms:
             self.fired_this_idle = False  # input since: the next idle may start it
         elif not self.fired_this_idle:
             self.fired_this_idle = True
@@ -86,9 +92,10 @@ class IdleWatcher:
                                   Gio.DBusCallFlags.NONE, 2000, None).unpack()
 
     def _arm(self, force=False):
-        if self.poll_id:
-            return  # polling reads the setting each time
         idle_ms = int(S.load().idle_minutes * 60_000)
+        if self.poll_id:  # polling: just remember the new threshold
+            self.idle_ms = idle_ms
+            return
         if idle_ms == self.idle_ms and not force:
             return
         try:

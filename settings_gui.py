@@ -49,7 +49,9 @@ def systemctl(*args):
 
 def unit_text():
     """The user service, pointing at wherever this folder is."""
-    here = str(HERE).replace("%", "%%")  # % is special in unit files
+    # inside ExecStart's double quotes: escape \ and ", $ -> $$, % -> %%
+    here = (str(HERE).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("$", "$$").replace("%", "%%"))
     return (HERE / "screenwave.service.in").read_text().replace("@HERE@", here)
 
 
@@ -154,6 +156,7 @@ class Window(Adw.ApplicationWindow):
             return False
         self.saved = self.s.copy()
         self.update_dirty()
+        self.show_state()  # its subtitle quotes the applied idle time
         self.toast("Applied. The screensaver uses these settings from its next start.")
         return True
 
@@ -201,6 +204,7 @@ class Window(Adw.ApplicationWindow):
         self.saved = S.load(warn=self.toast)
         if had_changes:
             self.update_dirty()
+            self.show_state()
             self.toast("The settings file changed outside this window. Revert loads it; "
                        "Apply replaces it with what is shown here.")
             return
@@ -230,6 +234,8 @@ class Window(Adw.ApplicationWindow):
 
         def on_value(r, _p):
             v = r.get_value()
+            if abs(v - getattr(self.s, key)) < 0.5 * 10 ** -digits:
+                return  # only the display rounded a hand-edited value
             setattr(self.s, key, int(round(v)) if digits == 0 else round(v, digits))
             self.changed()
         row.connect("notify::value", on_value)
@@ -404,6 +410,8 @@ class Window(Adw.ApplicationWindow):
 
             def on_shift(r, _p, name=name):
                 v = round(r.get_value(), 1)
+                if abs(v - self.s.screen_shift.get(name, 0.0)) < 0.05:
+                    return
                 if v:
                     self.s.screen_shift[name] = v
                 else:
@@ -441,9 +449,12 @@ class Window(Adw.ApplicationWindow):
             self.toast("Keep at least one monitor")
             row.set_active(True)
             return
-        # keep the display order; all of them is stored as "all" (empty)
+        # keep the display order; all of them is stored as "all" (empty);
+        # chosen monitors that are unplugged right now stay chosen
         chosen = [n for n in self.monitor_names if n in chosen]
-        self.s.monitors = [] if len(chosen) == len(self.monitor_names) else chosen
+        absent = [n for n in self.s.monitors if n not in self.monitor_names]
+        everything = len(chosen) == len(self.monitor_names) and not absent
+        self.s.monitors = [] if everything else absent + chosen
         self.changed()
 
     # -- lines ------------------------------------------------------------------
@@ -467,7 +478,8 @@ class Window(Adw.ApplicationWindow):
         return row
 
     def on_remove_line(self, _btn, row):
-        if len(self.line_rows) <= 1:
+        filled = [r for r in self.line_rows if r.get_text().strip()]
+        if len(self.line_rows) <= 1 or (row in filled and len(filled) <= 1):
             self.toast("Keep at least one line")
             return
         self.line_rows.remove(row)
@@ -479,6 +491,9 @@ class Window(Adw.ApplicationWindow):
         if lines:
             self.s.lines = lines
             self.changed()
+        else:
+            self.toast("Keep at least one line")
+            self.line_rows[0].set_text(self.s.lines[0])  # show what is still kept
 
     # -- palette ------------------------------------------------------------------
     def fill_palette(self):
@@ -603,32 +618,49 @@ class Window(Adw.ApplicationWindow):
             self.toast("Enabled: it starts after the idle time" if on else "Disabled")
 
     # -- running ------------------------------------------------------------------
+    def _launch(self, *extra):
+        """Start saver.py with the window's current settings (applied or not),
+        after stopping a preview or line-up still running from here."""
+        old = getattr(self, "child", None)
+        if old is not None:
+            old.force_exit()
+        try:
+            S.save(self.s, PREVIEW_INI)
+        except OSError as e:
+            self.toast(f"Could not start: {e}")
+            return None
+        self.child = Gio.Subprocess.new(
+            [sys.executable, str(HERE / "saver.py"), "--settings", str(PREVIEW_INI), *extra],
+            Gio.SubprocessFlags.NONE)
+        return self.child
+
     def on_align(self, *_):
-        """Line-up pattern on the real screens; afterwards read back what it saved."""
-        proc = Gio.Subprocess.new([sys.executable, str(HERE / "saver.py"), "--align"],
-                                  Gio.SubprocessFlags.NONE)
+        """Line-up pattern on the real screens with the window's settings.
+        Enter (exit 0) writes the positions to the preview file; they come
+        back here as an unapplied change."""
+        proc = self._launch("--align")
+        if proc is None:
+            return
 
         def done(p, result):
             p.wait_finish(result)
-            shift = S.load(warn=lambda m: None).screen_shift
-            # line-up saves straight away (Enter); keep the rest of the edits
+            if self.child is p:
+                self.child = None
+            if not p.get_if_exited() or p.get_exit_status() != 0:
+                self.toast("Line up cancelled")
+                return
+            shift = S.load(PREVIEW_INI, warn=lambda m: None).screen_shift
             self.s.screen_shift = dict(shift)
-            self.saved.screen_shift = dict(shift)
             self.build()
             self.rebuild_preview()
             self.update_dirty()
-            self.toast(f"Screen positions: {S.write_per_screen(shift) or 'none'}")
+            self.toast(f"Monitor positions set ({S.write_per_screen(shift) or 'none'}). "
+                       "Press Apply to keep them.")
         proc.wait_async(None, done)
 
     def on_run(self, *_):
         """Play now with what the window shows, applied or not."""
-        try:
-            S.save(self.s, PREVIEW_INI)
-        except OSError as e:
-            self.toast(f"Could not start the preview: {e}")
-            return
-        subprocess.Popen([sys.executable, str(HERE / "saver.py"), "--settings", str(PREVIEW_INI)],
-                         start_new_session=True)
+        self._launch()
 
     def on_open_file(self, *_):
         if not S.SETTINGS_FILE.exists():

@@ -24,7 +24,8 @@ Free to use, change and share under the [MIT licence](LICENSE).
   each monitor's reported size, so a 24″ screen next to 27″ ones shows
   everything at the same size. Tell it which edges are level on your desk
   (bottoms, centres or tops), or use **Line up screens**: a pattern you
-  nudge with the arrow keys until the lines run straight.
+  nudge with the arrow keys until the lines run straight, then Enter and
+  **Apply**.
 
 ## Install
 
